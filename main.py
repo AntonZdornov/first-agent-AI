@@ -1,238 +1,184 @@
 """
-agent.py — Minimal function-calling agent for LM Studio / OpenAI-compatible APIs
+agent_langchain.py — LangChain agent that uses your local LM Studio (OpenAI-compatible) and calls Python tools.
 
-Usage:
-  1) python -m venv .venv && source .venv/bin/activate  # (Windows: .venv\\Scripts\\activate)
-  2) pip install requests python-dotenv
-  3) Create .env (see below)
-  4) python agent.py "Add 41 and 1 using the add tool, then tell me the current time using get_time."
+Setup:
+  pip install -U langchain langchain-openai duckduckgo-search requests beautifulsoup4 python-dotenv
 
-.env example:
-  OPENAI_API_KEY=lm-studio                 # arbitrary for LM Studio
-  OPENAI_BASE_URL=http://localhost:1234/v1 # LM Studio → Developer → Local Server
-  MODEL=Your-Loaded-Model-Name            # e.g. Qwen2.5-7B-Instruct-GGUF
+.env (example):
+  OPENAI_BASE_URL=http://localhost:1234/v1
+  OPENAI_API_KEY=lm-studio
+  MODEL=Your-Loaded-Model-Name
 
-LM Studio: start local server (Developer → Local Server) to expose /v1/chat/completions.
+Run:
+  python agent_langchain.py "Find 2 best recent articles about asyncio in Python and summarize them in 3 bullets."
 """
 from __future__ import annotations
 
-import argparse
-import json
 import os
-import sys
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+import argparse
+from typing import List
 
-import requests
 from dotenv import load_dotenv
 
-# -----------------------------
-# Types
-# -----------------------------
-@dataclass
-class ChatMessage:
-    role: str
-    content: Optional[str] = None
-    tool_call_id: Optional[str] = None
-    name: Optional[str] = None
-    tool_calls: Optional[Any] = None
+# LangChain core
+from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain.agents import AgentExecutor, create_tool_calling_agent
+from langchain.tools import tool
+from langchain_openai import ChatOpenAI
+# Memory imports
+# from langchain_core.chat_history import InMemoryChatMessageHistory
+from langchain_community.chat_message_histories import FileChatMessageHistory
+from langchain_core.runnables.history import RunnableWithMessageHistory
 
-@dataclass
-class ToolSpec:
-    type: str
-    function: Dict[str, Any]
+# Optional web tools deps
+from duckduckgo_search import DDGS
+import requests
+from bs4 import BeautifulSoup
 
-@dataclass
-class ToolCall:
-    id: str
-    type: str
-    function: Dict[str, Any]
-
-# -----------------------------
-# Config
-# -----------------------------
 load_dotenv()
-BASE_URL = os.getenv("OPENAI_BASE_URL", "http://localhost:1234/v1")
-API_KEY = os.getenv("OPENAI_API_KEY", "lm-studio")
-MODEL = os.getenv("MODEL", "local-model")
 
-SYSTEM_PROMPT = (
-    "You are a practical software agent.\n"
-    "- When a tool is relevant, call it once with minimal arguments.\n"
-    "- If a tool call returns an error, explain the error and propose a fix.\n"
-    "- Keep answers short and actionable."
+# -----------------------------
+# Tools (via @tool decorator)
+# -----------------------------
+
+@tool
+def add(a: float, b: float) -> float:
+    """Add two numbers and return the sum."""
+    return a + b
+
+
+@tool
+def get_time() -> str:
+    """Return current UTC time in ISO 8601 format."""
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _extract_text(html: str) -> str:
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+    return " ".join(soup.get_text(" ").split())
+
+
+@tool
+def web_search(query: str, max_results: int = 5) -> list[dict]:
+    """Search the web via DuckDuckGo and return a list of {title, url, snippet}.
+
+    Args:
+        query: search query.
+        max_results: 1..10, how many results to return.
+    """
+    max_results = max(1, min(int(max_results), 10))
+    out: List[dict] = []
+    with DDGS() as ddgs:
+        for r in ddgs.text(query, max_results=max_results):
+            out.append({
+                "title": r.get("title"),
+                "url": r.get("href"),
+                "snippet": r.get("body"),
+            })
+    return out
+
+
+@tool
+def web_get(url: str, max_chars: int = 4000, timeout: int = 10) -> dict:
+    """Fetch a URL and return a plain‑text preview of the page content.
+
+    Args:
+        url: http/https link to fetch.
+        max_chars: truncate the extracted text to this many characters.
+        timeout: request timeout in seconds.
+    """
+    if not (isinstance(url, str) and url.startswith(("http://", "https://"))):
+        raise ValueError("web_get: valid http(s) URL required")
+    resp = requests.get(url, timeout=int(timeout), headers={"User-Agent": "LangChain-Agent/0.1"})
+    resp.raise_for_status()
+    text = _extract_text(resp.text)
+    preview = text[: int(max_chars)]
+    return {
+        "url": url,
+        "chars": len(text),
+        "preview": preview,
+        "truncated": len(text) > int(max_chars),
+    }
+
+
+TOOLS = [add, get_time, web_search, web_get]
+
+# -----------------------------
+# Model (LM Studio via OpenAI‑compatible base_url)
+# -----------------------------
+
+llm = ChatOpenAI(
+    model=os.getenv("MODEL", "local"),
+    api_key=os.getenv("OPENAI_API_KEY", "lm-studio"),
+    base_url=os.getenv("OPENAI_BASE_URL", "http://localhost:1234/v1"),
+    temperature=0.2,
 )
 
 # -----------------------------
-# Tool registry (add your own functions here)
+# Prompt + Agent
 # -----------------------------
 
-def tool_add(args: Dict[str, Any]) -> Dict[str, Any]:
-    a = args.get("a")
-    b = args.get("b")
-    if not isinstance(a, (int, float)) or not isinstance(b, (int, float)):
-        raise ValueError("add: a and b must be numbers")
-    return {"result": a + b}
+SYSTEM = (
+    "You are a pragmatic software agent. Use tools when helpful. "
+    "Cite URLs you used from web_get. Keep answers concise."
+)
 
+prompt = ChatPromptTemplate.from_messages([
+    ("system", SYSTEM),
+    MessagesPlaceholder(variable_name="chat_history", optional=True),
+    MessagesPlaceholder(variable_name="agent_scratchpad"),  # ← обязательный
+    ("user", "{input}"),
+])
 
-def tool_get_time(_args: Dict[str, Any]) -> Dict[str, Any]:
-    from datetime import datetime, timezone
+agent = create_tool_calling_agent(llm, TOOLS, prompt)
+executor = AgentExecutor(agent=agent, tools=TOOLS, verbose=True)
 
-    return {"iso": datetime.now(timezone.utc).isoformat()}
+# --- Simple in-memory chat history (per session_id) ---
+# _store: dict[str, InMemoryChatMessageHistory] = {}
 
+# def _get_session_history(session_id: str) -> InMemoryChatMessageHistory:
+#     if session_id not in _store:
+#         _store[session_id] = InMemoryChatMessageHistory()
+#     return _store[session_id]
 
-def tool_grep_text(args: Dict[str, Any]) -> Dict[str, Any]:
-    pattern = args.get("pattern")
-    text = args.get("text", "")
-    if not isinstance(pattern, str) or not isinstance(text, str):
-        raise ValueError("grep_text: 'pattern' and 'text' must be strings")
-    import re
+# запись в файл
+def _get_session_history(session_id: str):
+    return FileChatMessageHistory(f"./memory_{session_id}.json")
 
-    rx = re.compile(pattern, re.IGNORECASE | re.MULTILINE)
-    matches = [
-        {"match": m.group(0), "start": m.start(), "end": m.end()} for m in rx.finditer(text)
-    ]
-    return {"count": len(matches), "matches": matches}
-
-
-TOOL_REGISTRY = {
-    "add": tool_add,
-    "get_time": tool_get_time,
-    "grep_text": tool_grep_text,
-}
-
-TOOLS: List[ToolSpec] = [
-    ToolSpec(
-        type="function",
-        function={
-            "name": "add",
-            "description": "Add two numbers and return their sum",
-            "parameters": {
-                "type": "object",
-                "properties": {"a": {"type": "number"}, "b": {"type": "number"}},
-                "required": ["a", "b"],
-                "additionalProperties": False,
-            },
-        },
-    ),
-    ToolSpec(
-        type="function",
-        function={
-            "name": "get_time",
-            "description": "Get current time in ISO 8601 (UTC)",
-            "parameters": {"type": "object", "properties": {}, "additionalProperties": False},
-        },
-    ),
-    ToolSpec(
-        type="function",
-        function={
-            "name": "grep_text",
-            "description": "Search for a regex pattern in the provided text and return matches",
-            "parameters": {
-                "type": "object",
-                "properties": {"pattern": {"type": "string"}, "text": {"type": "string"}},
-                "required": ["pattern", "text"],
-                "additionalProperties": False,
-            },
-        },
-    ),
-]
-
-# -----------------------------
-# OpenAI-compatible /v1/chat/completions
-# -----------------------------
-
-def chat(messages: List[ChatMessage], tools: Optional[List[ToolSpec]] = None) -> Dict[str, Any]:
-    url = f"{BASE_URL}/chat/completions"
-    payload: Dict[str, Any] = {
-        "model": MODEL,
-        "messages": [m.__dict__ for m in messages],
-        "temperature": 0.2,
-        "tool_choice": "auto",
-    }
-    if tools:
-        payload["tools"] = [t.__dict__ for t in tools]
-
-    headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
-    r = requests.post(url, headers=headers, data=json.dumps(payload), timeout=120)
-    if not r.ok:
-        raise RuntimeError(f"HTTP {r.status_code}: {r.text}")
-    data = r.json()
-    choice = (data.get("choices") or [{}])[0]
-    return choice.get("message") or {}
-
-
-# -----------------------------
-# Agent loop: one round of tool use + final answer
-# -----------------------------
-
-def run_agent(user_prompt: str) -> str:
-    messages: List[ChatMessage] = [
-        ChatMessage(role="system", content=SYSTEM_PROMPT),
-        ChatMessage(role="user", content=user_prompt),
-    ]
-
-    first = chat(messages, TOOLS)
-    if first:
-        messages.append(ChatMessage(**first))
-
-    tool_calls = first.get("tool_calls") if isinstance(first, dict) else None
-    if tool_calls:
-        for tc in tool_calls:
-            name = tc["function"]["name"]
-            raw_args = tc["function"].get("arguments", "{}")
-            try:
-                parsed = json.loads(raw_args)
-            except Exception as e:
-                parsed = {}
-                result: Dict[str, Any] = {"error": f"Bad JSON args: {e}"}
-            else:
-                impl = TOOL_REGISTRY.get(name)
-                if impl is None:
-                    result = {"error": f"Tool not implemented: {name}"}
-                else:
-                    try:
-                        result = impl(parsed)
-                    except Exception as e:  # capture tool error and send back to model
-                        result = {"error": str(e)}
-
-            messages.append(
-                ChatMessage(
-                    role="tool",
-                    tool_call_id=tc.get("id"),
-                    content=json.dumps(result, ensure_ascii=False),
-                )
-            )
-
-        final = chat(messages)
-        if final:
-            messages.append(ChatMessage(**final))
-
-    # Return last assistant content
-    for m in reversed(messages):
-        if m.role == "assistant" and m.content:
-            return m.content
-    return "[no content]"
+executor_with_history = RunnableWithMessageHistory(
+    executor,
+    _get_session_history,
+    input_messages_key="input",        # matches prompt variable
+    history_messages_key="chat_history" # matches MessagesPlaceholder
+)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Minimal function-calling agent")
+    parser = argparse.ArgumentParser()
     parser.add_argument("prompt", nargs=argparse.REMAINDER, help="User prompt")
     args = parser.parse_args()
+    user_prompt = " ".join(args.prompt).strip() or "Add 41 and 1 using the add tool, then tell me the current time."
 
-    user_prompt = " ".join(args.prompt).strip()
-    if not user_prompt:
-        user_prompt = (
-            "Please add 41 and 1 using the add tool, then tell me the current time using get_time."
-        )
-
-    try:
-        out = run_agent(user_prompt)
-    except Exception as e:
-        print("Agent error:", e, file=sys.stderr)
-        sys.exit(1)
-    print("\n--- AGENT OUTPUT ---\n" + out)
+    # Minimal run (stateless). You can also pass chat_history=[...] for memory.
+    # Use a stable session_id to keep memory across calls
+    session_id = os.getenv("SESSION_ID", "anton")
+    print(f'session_id={session_id}')
+    result = executor_with_history.invoke(
+        {"input": user_prompt},
+        config={"configurable": {"session_id": session_id}},
+    )
+    print("\n--- AGENT OUTPUT ---\n" + str(result.get("output")))
 
 
 if __name__ == "__main__":
     main()
+
+
+# export SESSION_ID=anton
+# python agent_langchain.py "Привет, запомни что я люблю TypeScript."
+# python agent_langchain.py "Что я говорил о любимом языке?"
+# echo $SESSION_ID
