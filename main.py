@@ -35,6 +35,7 @@ class ChatMessage:
     content: Optional[str] = None
     tool_call_id: Optional[str] = None
     name: Optional[str] = None
+    tool_calls: Optional[Any] = None
 
 @dataclass
 class ToolSpec:
